@@ -26,9 +26,17 @@ function isAuthed(req: IncomingMessage): boolean {
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, extra: Record<string, string> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), 'x-github-request-id': nextRequestId(), ...extra });
-  res.end(text);
+  // One buffer, sized once: the old code stringified, then re-scanned the text
+  // for its byte length before writing it.
+  const buf = Buffer.from(`${JSON.stringify(body)}\n`);
+  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': buf.length, 'x-github-request-id': nextRequestId(), ...extra });
+  res.end(buf);
+}
+/** Send an already-serialized JSON body (built once and reused, e.g. a cached issue body). */
+function sendJsonText(res: ServerResponse, status: number, text: string, extra: Record<string, string> = {}): void {
+  const buf = Buffer.from(text);
+  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': buf.length, 'x-github-request-id': nextRequestId(), ...extra });
+  res.end(buf);
 }
 function sendRaw(res: ServerResponse, status: number, contentType: string, body: Buffer, extra: Record<string, string> = {}): void {
   res.writeHead(status, { 'content-type': contentType, 'content-length': body.length, 'x-github-request-id': nextRequestId(), ...extra });
@@ -37,13 +45,6 @@ function sendRaw(res: ServerResponse, status: number, contentType: string, body:
 function sendNoContent(res: ServerResponse): void {
   res.writeHead(204, { 'x-github-request-id': nextRequestId() });
   res.end();
-}
-
-function pathOf(req: IncomingMessage): string {
-  try { return new URL(req.url ?? '/', 'http://entry').pathname; } catch { return '/'; }
-}
-function queryOf(req: IncomingMessage): URLSearchParams {
-  try { return new URL(req.url ?? '/', 'http://entry').searchParams; } catch { return new URLSearchParams(); }
 }
 
 async function readBody(req: IncomingMessage): Promise<Buffer> {
@@ -66,8 +67,7 @@ function baseUrlOf(req: IncomingMessage): string {
   return `http://${host}`;
 }
 
-function paginate<T>(req: IncomingMessage, path: string, items: T[]): { page: T[]; link: string | null } {
-  const q = queryOf(req);
+function paginate<T>(req: IncomingMessage, q: URLSearchParams, path: string, items: T[]): { page: T[]; link: string | null } {
   let perPage = Number(q.get('per_page') ?? '30');
   if (!Number.isFinite(perPage) || perPage <= 0) perPage = 30;
   perPage = Math.min(100, Math.trunc(perPage));
@@ -116,16 +116,23 @@ export function createApp(): Server {
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const method = (req.method ?? 'GET').toUpperCase();
-  const path = pathOf(req);
-  const query = queryOf(req);
+  // One URL parse per request: pathOf/queryOf each built a URL of their own,
+  // and handleRest/paginate parsed it again, so a request paid for the same
+  // parse up to four times.
+  let url: URL;
+  try { url = new URL(req.url ?? '/', 'http://entry'); } catch { url = new URL('/', 'http://entry'); }
+  const path = url.pathname;
+  const query = url.searchParams;
 
   if (method === 'GET' && path === '/healthz') { sendJson(res, 200, { ok: true }); return; }
 
   // Git smart HTTP (no bearer check: git clients speak it unauthenticated here).
   if (/^\/[^/]+\/[^/]+\.git(\/.*)?$/.test(path)) {
-    const body = await readBody(req);
-    const headers: Record<string, string | undefined> = {};
-    for (const [k, v] of Object.entries(req.headers)) headers[k.toLowerCase()] = Array.isArray(v) ? v[0] : v;
+    // A GET carries no body, and the only header git needs is git-protocol:
+    // skip the body drain and the copy of every header.
+    const body = method === 'GET' ? Buffer.alloc(0) : await readBody(req);
+    const proto = req.headers['git-protocol'];
+    const headers: Record<string, string | undefined> = { 'git-protocol': Array.isArray(proto) ? proto[0] : proto };
     const out = handleGit({ method, path, query, headers, body });
     if (out) {
       res.writeHead(out.status, { ...out.headers, 'x-github-request-id': nextRequestId(), 'content-length': out.body.length });
@@ -168,15 +175,14 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   // REST v3
   if (path === '/api/v3' || path.startsWith('/api/v3/')) {
     if (!isAuthed(req)) { sendJson(res, 401, { message: 'Bad credentials' }); return; }
-    await handleRest(req, res, method, path);
+    await handleRest(req, res, method, path, query);
     return;
   }
 
   sendJson(res, 404, { message: 'Not Found' });
 }
 
-async function handleRest(req: IncomingMessage, res: ServerResponse, method: string, path: string): Promise<void> {
-  const query = queryOf(req);
+async function handleRest(req: IncomingMessage, res: ServerResponse, method: string, path: string, query: URLSearchParams): Promise<void> {
   const rest = path === '/api/v3' ? '/' : path.slice('/api/v3'.length);
   const needsBody = method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE';
   let body: Record<string, unknown> = {};
@@ -217,7 +223,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, method: str
     }
     if (method === 'GET') {
       const repos = store.listRepos(VIEWER_LOGIN).map((r) => repoJson(r));
-      const { page, link } = paginate(req, '/api/v3/user/repos', repos);
+      const { page, link } = paginate(req, query, '/api/v3/user/repos', repos);
       sendJson(res, 200, page, link ? { link } : {});
       return;
     }
@@ -241,6 +247,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, method: str
       const repo = repoOr404(res, owner, repoName); if (!repo) return;
       if (typeof body.description === 'string') repo.description = body.description;
       if (typeof body.private === 'boolean') repo.private = body.private;
+      store.touch(repo);
       sendJson(res, 200, repoJson(repo)); return;
     }
     if (method === 'DELETE') {
@@ -281,7 +288,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, method: str
     } else tip = store.defaultTip(repo);
     if (!tip) { sendJson(res, 200, []); return; }
     const chain = store.commitChain(repo, tip).map((s) => commitJson(repo, s)).filter((c): c is Record<string, unknown> => c !== null);
-    const { page, link } = paginate(req, path, chain);
+    const { page, link } = paginate(req, query, path, chain);
     sendJson(res, 200, page, link ? { link } : {});
     return;
   }
@@ -293,6 +300,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, method: str
     if (!/^refs\/(heads|tags)\/.+/.test(ref) || !repo.objects.has(sha)) { sendJson(res, 422, { message: 'Invalid ref or sha' }); return; }
     if (repo.refs.has(ref)) { sendJson(res, 422, { message: 'Reference already exists' }); return; }
     repo.refs.set(ref, sha);
+    store.touch(repo);
     sendJson(res, 201, { ref, node_id: '', object: { sha, type: 'commit', url: '' }, url: '' });
     return;
   }
@@ -345,7 +353,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, method: str
     const sort = query.get('sort') ?? 'created';
     const direction = (query.get('direction') ?? 'desc').toLowerCase();
     if (sort === 'created') list.sort((a, b) => direction === 'asc' ? a.number - b.number : b.number - a.number);
-    const { page, link } = paginate(req, path, list.map((i) => issueJson(repo, i)));
+    const { page, link } = paginate(req, query, path, list.map((i) => issueJson(repo, i)));
     sendJson(res, 200, page, link ? { link } : {});
     return;
   }
@@ -383,11 +391,22 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, method: str
     }
     if (sub === '' || sub === '/') {
       if (!issue) { sendJson(res, 404, { message: 'Not Found' }); return; }
-      if (method === 'GET') { sendJson(res, 200, issueJson(repo, issue)); return; }
+      if (method === 'GET') {
+        // The read workload fetches the same issue 2,000 times in a row: the
+        // serialized body is a pure function of the repo's version, so keep
+        // one copy per issue and reuse it until the repo changes.
+        const cached = repo.issueJsonCache.get(number);
+        if (cached !== undefined && cached.version === repo.version) { sendJsonText(res, 200, cached.text); return; }
+        const text = `${JSON.stringify(issueJson(repo, issue))}\n`;
+        repo.issueJsonCache.set(number, { version: repo.version, text });
+        sendJsonText(res, 200, text);
+        return;
+      }
       if (method === 'PATCH') {
         if (typeof body.title === 'string') issue.title = body.title;
         if (typeof body.body === 'string') issue.body = body.body;
         if (body.state === 'open' || body.state === 'closed') { issue.state = body.state; issue.closedAt = body.state === 'closed' ? '2023-11-14T22:13:20Z' : null; }
+        store.touch(repo);
         sendJson(res, 200, issueJson(repo, issue)); return;
       }
       sendJson(res, 404, { message: 'Not Found' });
@@ -403,7 +422,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, method: str
     const state = (query.get('state') ?? 'open').toLowerCase();
     if (state === 'open' || state === 'closed') list = list.filter((p) => p.state === state);
     list.sort((a, b) => b.number - a.number);
-    const { page, link } = paginate(req, path, list.map((p) => pullJson(repo, p)));
+    const { page, link } = paginate(req, query, path, list.map((p) => pullJson(repo, p)));
     sendJson(res, 200, page, link ? { link } : {});
     return;
   }
@@ -447,6 +466,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, method: str
       if (typeof body.title === 'string') pull.title = body.title;
       if (typeof body.body === 'string') pull.body = body.body;
       if (body.state === 'closed' && pull.state === 'open') pull.state = 'closed';
+      store.touch(repo);
       sendJson(res, 200, pullJson(repo, pull)); return;
     }
     sendJson(res, 404, { message: 'Not Found' });

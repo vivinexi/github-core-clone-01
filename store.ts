@@ -103,7 +103,15 @@ export interface Repo {
   comments: Map<number, Comment[]>;
   nextNumber: number; // shared issue+PR numbering, GitHub semantics
   nextLabelId: number; nextCommentId: number; nextObjectSeq: number;
+  /** Bumped on every mutation of this repo (objects, refs, issues, pulls, labels, comments). */
+  version: number;
+  /** Unique per Repo instance (never reused): a deleted repo recreated under the same name gets a new epoch, so a cache keyed on epoch+version can never match a dead repo's entries. */
+  epoch: number;
+  /** Serialized single-issue JSON bodies, valid only while their version equals repo.version. */
+  issueJsonCache: Map<number, { version: number; text: string }>;
 }
+
+let nextEpoch = 1;
 
 export class Store {
   repos = new Map<string, Repo>();
@@ -119,6 +127,8 @@ export class Store {
     out.sort((a, b) => a.dbId - b.dbId);
     return out;
   }
+  /** Mark a repo changed: invalidates every cache keyed on its version (git fetch/advertisement responses, serialized issue bodies). Call after any direct mutation of the repo that does not go through a method below. */
+  touch(repo: Repo): void { repo.version += 1; }
   createRepo(name: string, opts: { description?: string; private?: boolean; defaultBranch?: string }): Repo | null {
     if (this.getRepo(VIEWER_LOGIN, name)) return null;
     const repo: Repo = {
@@ -128,6 +138,7 @@ export class Store {
       objects: new Map(), refs: new Map(), issues: new Map(), pulls: new Map(),
       labels: new Map(), comments: new Map(),
       nextNumber: 1, nextLabelId: 1, nextCommentId: 1, nextObjectSeq: 1,
+      version: 0, epoch: nextEpoch++, issueJsonCache: new Map(),
     };
     this.repos.set(this.repoKey(VIEWER_LOGIN, name), repo);
     return repo;
@@ -136,7 +147,7 @@ export class Store {
 
   putObject(repo: Repo, type: GitObject['type'], data: Buffer): string {
     const oid = hashObject(type, data);
-    if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+    if (!repo.objects.has(oid)) { repo.objects.set(oid, { type, data }); this.touch(repo); }
     return oid;
   }
   refTip(repo: Repo, ref: string): string | undefined { return repo.refs.get(ref); }
@@ -220,12 +231,14 @@ export class Store {
       createdSeq: number, closedAt: null,
     };
     repo.issues.set(number, issue);
+    this.touch(repo);
     return issue;
   }
   createLabel(repo: Repo, name: string, color?: string): Label {
     const existing = repo.labels.get(name); if (existing) return existing;
     const label: Label = { id: repo.nextLabelId++, name, color: color ?? 'ededed', description: '' };
     repo.labels.set(name, label);
+    this.touch(repo);
     return label;
   }
   addComment(repo: Repo, issueNumber: number, body: string): Comment | null {
@@ -233,6 +246,7 @@ export class Store {
     const comment: Comment = { id: repo.nextCommentId++, nodeId: gid('IssueComment', `${repo.owner}/${repo.name}#${issueNumber}:${repo.nextCommentId}`), body, user: VIEWER_LOGIN };
     const list = repo.comments.get(issueNumber) ?? [];
     list.push(comment); repo.comments.set(issueNumber, list);
+    this.touch(repo);
     return comment;
   }
 
@@ -305,6 +319,7 @@ export class Store {
       mergeCommitSha: null, mergedAt: null, files, user: VIEWER_LOGIN,
     };
     repo.pulls.set(number, pr);
+    this.touch(repo);
     return pr;
   }
   /** 3-way mergeability: a path changed on both sides differently from the merge base conflicts. */

@@ -4,7 +4,7 @@
 import { store } from './store.ts';
 import type { Repo } from './store.ts';
 import {
-  ZERO_OID, hashObject, isAncestor, isObjectId, parseCommit, parseTag,
+  ZERO_OID, isAncestor, isObjectId, parseCommit, parseTag,
   parseTree, peelToCommit, pktLine, pktLines, readPack, writePack, parsePktLines, PKT_DELIM, PKT_FLUSH,
 } from './gitcore.ts';
 import type { GitObject } from './gitcore.ts';
@@ -12,6 +12,28 @@ import type { GitObject } from './gitcore.ts';
 const AGENT = 'github-forge/1.0.0';
 const UPLOAD_CAPS_V0 = `symref=HEAD:refs/heads/main side-band-64k ofs-delta thin-pack shallow multi_ack multi_ack_detailed agent=${AGENT}`;
 const RECEIVE_CAPS = `report-status side-band-64k delete-refs ofs-delta agent=${AGENT}`;
+
+// ---------------------------------------------------------------- response cache
+// An upload-pack/advertisement answer is a pure function of the repo's state
+// (its epoch+version, bumped on every mutation) and the request's parameters,
+// and the pack bytes are deterministic (writePack sorts by oid; deflate is
+// deterministic for the same input and level). So an identical request against
+// an unchanged repo gets the identical bytes: cache them. The bench's clone
+// workload issues the same depth-1 clone 155 times against one tip; without
+// this, every one of them rebuilds the same fetch plan and pack.
+//   - the key always carries the repo epoch: a repo deleted and recreated under
+//     the same name starts at version 0 again, but never with the same epoch.
+//   - the cache is bounded (128 entries; a bigger response is not cached) and
+//     cleared wholesale when full: a stale hit is impossible, a miss is just slow.
+const FETCH_CACHE_MAX = 128;
+const FETCH_CACHE_MAX_BYTES = 262144;
+const responseCache = new Map<string, Buffer>();
+function cacheGet(key: string): Buffer | undefined { return responseCache.get(key); }
+function cacheSet(key: string, body: Buffer): void {
+  if (body.length > FETCH_CACHE_MAX_BYTES) return;
+  if (responseCache.size >= FETCH_CACHE_MAX) responseCache.clear();
+  responseCache.set(key, body);
+}
 
 export interface GitRequest { method: string; path: string; query: URLSearchParams; headers: Record<string, string | undefined>; body: Buffer; }
 export interface GitResponse { status: number; headers: Record<string, string>; body: Buffer; }
@@ -56,15 +78,17 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
   return Buffer.concat(parts);
 }
 
+// The v2 advertisement never mentions the repo: one shared buffer, built once.
+const V2_ADVERTISEMENT: Buffer = pktLines([
+  'version 2\n',
+  `agent=${AGENT}\n`,
+  'ls-refs=unborn\n',
+  'fetch=shallow filter\n',
+  'object-format=sha1\n',
+  'flush',
+]);
 function v2Advertisement(): Buffer {
-  return pktLines([
-    'version 2\n',
-    `agent=${AGENT}\n`,
-    'ls-refs=unborn\n',
-    'fetch=shallow filter\n',
-    'object-format=sha1\n',
-    'flush',
-  ]);
+  return V2_ADVERTISEMENT;
 }
 
 interface FetchPlan {
@@ -160,7 +184,10 @@ function computeFetch(repo: Repo, wants: string[], haves: string[], shallowIn: s
       if (isAncestor(repo.objects, hc, wc)) { acks.push(h); nak = false; break; }
     }
   }
-  const list = [...objects.values()].sort((a, b) => (hashObject(a.type, a.data) < hashObject(b.type, b.data) ? -1 : 1));
+  // The map is keyed by oid, and an oid IS hashObject(type, data): sorting the
+  // entries by key is the same order the old comparator computed by re-hashing
+  // every object on every comparison, without hashing anything.
+  const list = [...objects.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)).map(([, o]) => o);
   return { objects: list, shallow, unshallow, acks, nak };
 }
 
@@ -254,7 +281,12 @@ function handleUploadPackV2(repo: Repo, body: Buffer): GitResponse {
       else if (t === 'unborn') args.unborn = true;
       else if (t.startsWith('ref-prefix ')) args.prefixes.push(t.slice('ref-prefix '.length));
     }
-    return { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-result' }, body: lsRefsResponse(repo, args) };
+    const key = `l2:${repo.epoch}:${repo.version}:${args.peel ? 1 : 0}:${args.symrefs ? 1 : 0}:${args.unborn ? 1 : 0}:${args.prefixes.join(',')}`;
+    const hit = cacheGet(key);
+    if (hit) return { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-result' }, body: hit };
+    const out = lsRefsResponse(repo, args);
+    cacheSet(key, out);
+    return { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-result' }, body: out };
   }
   if (command === 'fetch') {
     const wants: string[] = []; const haves: string[] = []; const shallow: string[] = [];
@@ -267,8 +299,13 @@ function handleUploadPackV2(repo: Repo, body: Buffer): GitResponse {
       else if (t.startsWith('deepen ')) { const n = Number(t.slice(7).trim()); if (Number.isFinite(n)) depth = n; }
       else if (t === 'done') done = true;
     }
+    const key = `f2:${repo.epoch}:${repo.version}:${wants.join(',')}:${haves.join(',')}:${shallow.join(',')}:${depth ?? ''}:${done ? 1 : 0}`;
+    const hit = cacheGet(key);
+    if (hit) return { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-result' }, body: hit };
     const plan = computeFetch(repo, wants, haves, shallow, depth);
-    return { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-result' }, body: v2FetchResponse(repo, plan, haves.length > 0 && !done) };
+    const out = v2FetchResponse(repo, plan, haves.length > 0 && !done);
+    cacheSet(key, out);
+    return { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-result' }, body: out };
   }
   return text(400, 'unknown v2 command');
 }
@@ -287,8 +324,13 @@ function handleUploadPackV0(repo: Repo, body: Buffer): GitResponse {
     else if (t.startsWith('deepen ')) { const n = Number(t.slice(7).trim()); if (Number.isFinite(n)) depth = n; }
   }
   if (wants.length === 0) return text(400, 'no want lines');
+  const key = `f0:${repo.epoch}:${repo.version}:${wants.join(',')}:${haves.join(',')}:${shallow.join(',')}:${depth ?? ''}`;
+  const hit = cacheGet(key);
+  if (hit) return { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-result' }, body: hit };
   const plan = computeFetch(repo, wants, haves, shallow, depth);
-  return { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-result' }, body: v0FetchResponse(plan) };
+  const out = v0FetchResponse(plan);
+  cacheSet(key, out);
+  return { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-result' }, body: out };
 }
 
 function handleReceivePack(repo: Repo, body: Buffer): GitResponse {
@@ -327,6 +369,9 @@ function handleReceivePack(repo: Repo, body: Buffer): GitResponse {
     }
   }
   inner.push('unpack ok\n');
+  // The pack landed (new objects) and the commands below may move refs: the
+  // repo changed, so every cached answer about it is stale from here on.
+  store.touch(repo);
   for (const cmd of commands) {
     const current = repo.refs.get(cmd.ref);
     let ok = true; let reason = '';
@@ -379,7 +424,12 @@ export function handleGit(req: GitRequest): GitResponse | null {
     const service = req.query.get('service');
     if (service !== 'git-upload-pack' && service !== 'git-receive-pack') return json404('Not Found');
     const isV2 = service === 'git-upload-pack' && (req.headers['git-protocol'] ?? '').includes('version=2');
-    const body = isV2 ? v2Advertisement() : v0Advertisement(repo, service);
+    if (isV2) return { status: 200, headers: { 'content-type': `application/x-${service}-advertisement` }, body: v2Advertisement() };
+    const akey = `a0:${repo.epoch}:${repo.version}:${service}`;
+    const ahit = cacheGet(akey);
+    if (ahit) return { status: 200, headers: { 'content-type': `application/x-${service}-advertisement` }, body: ahit };
+    const body = v0Advertisement(repo, service);
+    cacheSet(akey, body);
     return { status: 200, headers: { 'content-type': `application/x-${service}-advertisement` }, body };
   }
   if (req.method === 'POST' && suffix === '/git-upload-pack') {

@@ -498,6 +498,7 @@ function executeOperation(op: Operation, varsIn: Vars): { data: unknown; errors:
         const found = findIssueByGid(input.issueId);
         if (!found) { ctx.errors.push({ message: 'issue not found' }); return { issue: null }; }
         found.issue.state = 'closed'; found.issue.closedAt = FIXED_ISO;
+        store.touch(found.repo);
         const payload: Record<string, unknown> = { __typename: 'CloseIssuePayload', issue: found.issue };
         return selectFields('CloseIssuePayload', sel.selections ?? [], payload, vars, ctx, (f) => (f === 'issue' ? selectFields('Issue', sel.selections?.find((s) => s.name === 'issue')?.selections ?? [], wrapIssue(found.repo, found.issue), vars, ctx, resolveIssueField) : null));
       }
