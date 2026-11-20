@@ -1,6 +1,8 @@
 # github-forge — make.fun bounty github-core-clone-01
 
-[![make.fun bounty](https://img.shields.io/badge/make.fun-bounty%20github--core--clone--01-blue)](https://make.fun/bounty/github-core-clone-01)
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/vivinexi/github-core-clone-01/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/vivinexi/github-core-clone-01/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 
 A GitHub-compatible git forge built for [the make.fun bounty **github-core-clone-01**](https://make.fun/bounty/github-core-clone-01) ("Build a GitHub-compatible git forge", free entry, $500 over 20 places). One Node 22 stdlib-only process serves the whole surface: git smart HTTP (upload-pack v2 with v0 fallback, receive-pack v0), REST v3, GraphQL v4, and MCP over streamable HTTP — all backed by one in-memory store, with git objects, packfiles and refs implemented by hand in TypeScript (no dependencies, no git binary, no network).
 
